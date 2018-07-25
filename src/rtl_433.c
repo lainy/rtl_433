@@ -30,6 +30,14 @@
 #include "data.h"
 #include "util.h"
 #include "optparse.h"
+#ifdef SOAPYSDR
+    #include "convenience.h"
+    #include <SoapySDR/Device.h>
+    #include <SoapySDR/Formats.h>
+    #include <SoapySDR/Logger.h>
+    // FIXME:
+    #define rtlsdr_cancel_async(dev) do_exit_async=1
+#endif
 
 #define MAX_DATA_OUTPUTS 32
 
@@ -45,7 +53,13 @@ int stop_after_successful_events_flag = 0;
 uint32_t samp_rate = DEFAULT_SAMPLE_RATE;
 float sample_file_pos = -1;
 static uint32_t bytes_to_read = 0;
+#ifdef SOAPYSDR
+static SoapySDRDevice *dev = NULL;
+static SoapySDRStream *stream = NULL;
+char *dev_query = "";
+#else
 static rtlsdr_dev_t *dev = NULL;
+#endif
 static int override_short = 0;
 static int override_long = 0;
 int include_only = 0;  // Option -I
@@ -1014,7 +1028,7 @@ int main(int argc, char **argv) {
     FILE *in_file;
     int n_read;
     int r = 0, opt;
-    int gain = 0;
+    char *gain_str = NULL;
     uint32_t i = 0;
     int sync_mode = 0;
     int ppm_error = 0;
@@ -1027,6 +1041,10 @@ int main(int argc, char **argv) {
     int have_opt_R = 0;
     int register_all = 0;
     r_device *flex_device = NULL;
+#ifdef SOAPYSDR
+    double fullScale;
+    SoapySDR_setLogLevel(SOAPY_SDR_DEBUG);
+#endif
 
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
@@ -1060,7 +1078,7 @@ int main(int argc, char **argv) {
                 demod->hop_time = atoi_time(optarg, "-H: ");
                 break;
             case 'g':
-                gain = (int) (atof(optarg) * 10); /* tenths of a dB */
+                gain_str = optarg;
                 break;
             case 'G':
                 register_all = 1;
@@ -1252,6 +1270,25 @@ int main(int argc, char **argv) {
     }
 
     if (!in_filename) {
+#ifdef SOAPYSDR
+        r = verbose_device_search(dev_query, &dev, &stream, SOAPY_SDR_CS16); // CS8 or CS16; CU8 does not work
+
+        if (r != 0) {
+            fprintf(stderr, "Failed to open sdr device matching '%s'.\n", dev_query);
+            exit(1);
+        }
+
+        // TODO: select a stream format, in preference order: CU8, CS8, CS16, CF32
+        // stream_formats = SoapySDRDevice_getStreamFormats(dev, direction, channel, &len);
+        // TODO: adjust fullScale if this is the native format
+        demod->sample_size = sizeof(int16_t);
+        char *native_stream_format = SoapySDRDevice_getNativeStreamFormat(dev, SOAPY_SDR_RX, 0, &fullScale);
+        if (!strcmp(SOAPY_SDR_CS16, native_stream_format)) {
+            // e.g. LimeSDR-mini is 2048.0
+        } else {
+            fullScale = 32768.0; // assume max for SOAPY_SDR_CS16
+        }
+#else
     device_count = rtlsdr_get_device_count();
     if (!device_count) {
         fprintf(stderr, "No supported devices found.\n");
@@ -1306,6 +1343,7 @@ int main(int argc, char **argv) {
         if (!quiet_mode) fprintf(stderr, "Unable to open a device\n");
         exit(1);
     }
+#endif
 
 #ifndef _WIN32
     sigact.sa_handler = sighandler;
@@ -1319,14 +1357,30 @@ int main(int argc, char **argv) {
     SetConsoleCtrlHandler((PHANDLER_ROUTINE) sighandler, TRUE);
 #endif
     /* Set the sample rate */
+#ifdef SOAPYSDR
+    verbose_set_sample_rate(dev, samp_rate);
+#else
     r = rtlsdr_set_sample_rate(dev, samp_rate);
     if (r < 0)
         fprintf(stderr, "WARNING: Failed to set sample rate.\n");
     else
         fprintf(stderr, "Sample rate set to %d.\n", rtlsdr_get_sample_rate(dev)); // Unfortunately, doesn't return real rate
+#endif
 
     fprintf(stderr, "Bit detection level set to %d%s.\n", demod->level_limit, (demod->level_limit ? "" : " (Auto)"));
 
+#ifdef SOAPYSDR
+    if (!gain_str || !*gain_str) {
+        /* Enable automatic gain */
+        verbose_auto_gain(dev);
+    } else {
+        /* Enable manual gain */
+        verbose_gain_str_set(dev, gain_str);
+    }
+
+    verbose_ppm_set(dev, ppm_error);
+#else
+    int gain = (int) (atof(gain_str) * 10); /* tenths of a dB */
     if (0 == gain) {
         /* Enable automatic gain */
         r = rtlsdr_set_tuner_gain_mode(dev, 0);
@@ -1349,6 +1403,7 @@ int main(int argc, char **argv) {
     }
 
     r = rtlsdr_set_freq_correction(dev, ppm_error);
+#endif
 
     }
 
@@ -1450,9 +1505,13 @@ int main(int argc, char **argv) {
     }
 
     /* Reset endpoint before we start reading from it (mandatory) */
+#ifdef SOAPYSDR
+    verbose_reset_buffer(dev);
+#else
     r = rtlsdr_reset_buffer(dev);
     if (r < 0)
         fprintf(stderr, "WARNING: Failed to reset buffers.\n");
+#endif
 
     if (sync_mode) {
         if (!demod->out_file) {
@@ -1469,7 +1528,11 @@ int main(int argc, char **argv) {
         }
         time_t timestamp;
         while (!do_exit) {
+#ifdef SOAPYSDR
+            r = -1; // FIXME:
+#else
             r = rtlsdr_read_sync(dev, buffer, out_block_size, &n_read);
+#endif
             if (r < 0) {
                 fprintf(stderr, "WARNING: sync read failed.\n");
                 break;
@@ -1517,7 +1580,14 @@ int main(int argc, char **argv) {
             time(&stop_time);
             stop_time += duration;
         }
+#ifdef SOAPYSDR
+        size_t out_block_elems = out_block_size / 2;
+        int16_t *buffer = malloc(out_block_elems * SoapySDR_formatToSize(SOAPY_SDR_CS16));
+#endif
         while (!do_exit) {
+#ifdef SOAPYSDR
+            verbose_set_frequency(dev, frequency[frequency_current]);
+#else
             /* Set the frequency */
             center_frequency = frequency[frequency_current];
             r = rtlsdr_set_center_freq(dev, center_frequency);
@@ -1525,6 +1595,61 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "WARNING: Failed to set center freq.\n");
             else
                 fprintf(stderr, "Tuned to %s.\n", nice_freq(rtlsdr_get_center_freq(dev)));
+#endif
+#ifdef SOAPYSDR
+            if (SoapySDRDevice_activateStream(dev, stream, 0, 0, 0) != 0)
+            {
+                fprintf(stderr, "Failed to activate stream\n");
+                exit(1);
+            }
+
+            do {
+                void *buffs[] = {buffer};
+                int flags = 0;
+                long long timeNs = 0;
+                long timeoutUs = 1000000; // 1 second
+                unsigned n_read = 0;
+
+                do {
+                    buffs[0] = &buffer[n_read * 2];
+                    r = SoapySDRDevice_readStream(dev, stream, buffs, out_block_elems - n_read, &flags, &timeNs, timeoutUs);
+                    if (r < 0)
+                        break;
+                    n_read += r; // r is number of elements read, elements=complex pairs, so buffer length is twice
+                    //fprintf(stderr, "readStream ret=%d, flags=%d, timeNs=%lld (%zu - %u)\n", r, flags, timeNs, out_block_elems, n_read);
+                } while (n_read < out_block_elems);
+                //fprintf(stderr, "readStream ret=%d (%d), flags=%d, timeNs=%lld\n", n_read, out_block_size, flags, timeNs);
+                if (r < 0) {
+                    if (r == SOAPY_SDR_OVERFLOW) {
+                        fprintf(stderr, "O");
+                        fflush(stderr);
+                        continue;
+                    }
+                    fprintf(stderr, "WARNING: sync read failed. %d\n", r);
+                }
+
+                // convert to CS16 or CU8 if needed
+                // if converting CS8 to CU8 -- vectorized with -O3
+                //for (i = 0; i < n_read * 2; ++i)
+                //    cu8buf[i] = (int8_t)cu8buf[i] + 128;
+
+                // rescale cs16 buffer
+                if (fullScale == 2048.0) {
+                    for (i = 0; i < n_read * 2; ++i)
+                        buffer[i] << 4;
+                }
+                else if (fullScale != 32768.0) {
+                    int upscale = 32768 / fullScale;
+                    for (i = 0; i < n_read * 2; ++i)
+                        buffer[i] *= upscale;
+                }
+
+                rtlsdr_callback((unsigned char *)buffer, n_read*2*2, (void *)demod);
+
+            } while (!do_exit_async);
+
+#else
+
 #ifndef _WIN32
             signal(SIGALRM, sighandler);
             alarm(3); // require callback to run every 3 second, abort otherwise
@@ -1538,6 +1663,8 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
             alarm(0); // cancel the watchdog timer
 #endif
+
+#endif
             do_exit_async = 0;
             frequency_current = (frequency_current + 1) % frequencies;
         }
@@ -1549,6 +1676,11 @@ int main(int argc, char **argv) {
     if (demod->out_file && (demod->out_file != stdout))
         fclose(demod->out_file);
 
+#ifdef SOAPYSDR
+    SoapySDRDevice_deactivateStream(dev, stream, 0, 0);
+    SoapySDRDevice_closeStream(dev, stream);
+#endif
+
     for (i = 0; i < demod->r_dev_num; i++)
         free(demod->r_devs[i]);
 
@@ -1557,7 +1689,11 @@ int main(int argc, char **argv) {
 
     free(demod);
 
+#ifdef SOAPYSDR
+    SoapySDRDevice_unmake(dev);
+#else
     rtlsdr_close(dev);
+#endif
 out:
     for (int i = 0; i < last_output_handler; ++i) {
         data_output_free(output_handler[i]);
