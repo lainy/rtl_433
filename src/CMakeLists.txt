@@ -66,6 +66,7 @@ add_executable(rtl_433
 	devices/oregon_scientific.c
 	devices/oregon_scientific_v1.c
 	devices/prologue.c
+	devices/quorum_window_door.c
 	devices/rubicson.c
 	devices/silvercrest.c
 	devices/springfield.c
